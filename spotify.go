@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -32,6 +33,15 @@ const (
 	defaultRetryDuration = time.Second * 5
 )
 
+// TokenRefresher interface for handling token refresh
+type TokenRefresher interface {
+	RefreshToken(ctx context.Context, token *oauth2.Token) (*oauth2.Token, error)
+	Client(ctx context.Context, token *oauth2.Token) *http.Client
+}
+
+// TokenUpdateCallback is a function type for token update callbacks
+type TokenUpdateCallback func(oldToken, newToken *oauth2.Token)
+
 // Client is a client for working with the Spotify Web API.
 // It is best to create this using spotify.New()
 type Client struct {
@@ -40,6 +50,12 @@ type Client struct {
 
 	autoRetry      bool
 	acceptLanguage string
+
+	// Token refresh fields
+	authenticator       TokenRefresher
+	token               *oauth2.Token
+	tokenMutex          sync.RWMutex
+	tokenUpdateCallback TokenUpdateCallback
 }
 
 type ClientOption func(client *Client)
@@ -66,6 +82,21 @@ func WithAcceptLanguage(lang string) ClientOption {
 	}
 }
 
+// WithTokenRefresher configures the client to automatically refresh tokens when encountering 401 responses.
+func WithTokenRefresher(auth TokenRefresher, token *oauth2.Token) ClientOption {
+	return func(client *Client) {
+		client.authenticator = auth
+		client.token = token
+	}
+}
+
+// WithTokenUpdateCallback configures a callback function that will be called whenever the token is updated.
+func WithTokenUpdateCallback(callback TokenUpdateCallback) ClientOption {
+	return func(client *Client) {
+		client.tokenUpdateCallback = callback
+	}
+}
+
 // New returns a client for working with the Spotify Web API.
 // The provided httpClient must provide Authentication with the requests.
 // The auth package may be used to generate a suitable client.
@@ -80,6 +111,39 @@ func New(httpClient *http.Client, opts ...ClientOption) *Client {
 	}
 
 	return c
+}
+
+// NewWithTokenRefresh creates a new client with automatic token refresh capability.
+// This is a convenience function for creating a client that will automatically refresh
+// tokens when encountering 401 responses.
+func NewWithTokenRefresh(auth TokenRefresher, token *oauth2.Token, opts ...ClientOption) *Client {
+	// Create the initial HTTP client with the token
+	httpClient := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(token))
+
+	// Create the client with token refresh capability
+	clientOpts := append([]ClientOption{
+		WithRetry(true),
+		WithTokenRefresher(auth, token),
+	}, opts...)
+
+	return New(httpClient, clientOpts...)
+}
+
+// NewWithTokenRefreshCallback creates a new client with automatic token refresh capability and a callback.
+// This is a convenience function for creating a client that will automatically refresh
+// tokens when encountering 401 responses and call the provided callback when tokens are updated.
+func NewWithTokenRefreshCallback(auth TokenRefresher, token *oauth2.Token, callback TokenUpdateCallback, opts ...ClientOption) *Client {
+	// Create the initial HTTP client with the token
+	httpClient := oauth2.NewClient(context.Background(), oauth2.StaticTokenSource(token))
+
+	// Create the client with token refresh capability and callback
+	clientOpts := append([]ClientOption{
+		WithRetry(true),
+		WithTokenRefresher(auth, token),
+		WithTokenUpdateCallback(callback),
+	}, opts...)
+
+	return New(httpClient, clientOpts...)
 }
 
 // URI identifies an artist, album, track, or category.  For example,
@@ -217,10 +281,46 @@ func decodeError(resp *http.Response) error {
 	return e.E
 }
 
+// refreshTokenIfNeeded refreshes the token if a 401 response is received
+func (c *Client) refreshTokenIfNeeded(ctx context.Context, statusCode int) error {
+	if statusCode != http.StatusUnauthorized || c.authenticator == nil {
+		return nil
+	}
+
+	c.tokenMutex.Lock()
+	defer c.tokenMutex.Unlock()
+
+	// Get the current token from the oauth2 transport
+	currentToken, err := c.Token()
+	if err != nil {
+		return fmt.Errorf("failed to get current token: %w", err)
+	}
+
+	// If we have an authenticator, try to refresh the token
+	newToken, err := c.authenticator.RefreshToken(ctx, currentToken)
+	if err != nil {
+		return fmt.Errorf("failed to refresh token: %w", err)
+	}
+
+	// Update the stored token
+	c.token = newToken
+
+	// Call the token update callback if set
+	if c.tokenUpdateCallback != nil {
+		c.tokenUpdateCallback(currentToken, newToken)
+	}
+
+	// Create a new HTTP client with the refreshed token
+	// Use the authenticator's client method to ensure proper oauth2 setup
+	c.http = c.authenticator.Client(ctx, newToken)
+
+	return nil
+}
+
 // shouldRetry determines whether the status code indicates that the
 // previous operation should be retried at a later time
 func shouldRetry(status int) bool {
-	return status == http.StatusAccepted || status == http.StatusTooManyRequests
+	return status == http.StatusAccepted || status == http.StatusTooManyRequests || status == http.StatusUnauthorized
 }
 
 // isFailure determines whether the code indicates failure
@@ -240,7 +340,25 @@ func (c *Client) execute(req *http.Request, result interface{}, needsStatus ...i
 	if c.acceptLanguage != "" {
 		req.Header.Set("Accept-Language", c.acceptLanguage)
 	}
-	for {
+
+	// Buffer the request body for potential retries
+	var bodyBytes []byte
+	if req.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		if err != nil {
+			return err
+		}
+		req.Body.Close()
+	}
+
+	maxRetries := 2 // Allow one retry after token refresh
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
+		// Recreate the request body for each attempt
+		if bodyBytes != nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return err
@@ -250,13 +368,26 @@ func (c *Client) execute(req *http.Request, result interface{}, needsStatus ...i
 		if c.autoRetry &&
 			isFailure(resp.StatusCode, needsStatus) &&
 			shouldRetry(resp.StatusCode) {
+
+			// Handle 401 specifically for token refresh
+			if resp.StatusCode == http.StatusUnauthorized {
+				if err := c.refreshTokenIfNeeded(req.Context(), resp.StatusCode); err != nil {
+					return fmt.Errorf("token refresh failed: %w", err)
+				}
+				// Continue to retry the request with the new token
+				continue
+			}
+
+			// Handle other retryable errors (rate limiting, etc.)
 			select {
 			case <-req.Context().Done():
 				// If the context is cancelled, return the original error
+				return req.Context().Err()
 			case <-time.After(retryDuration(resp)):
 				continue
 			}
 		}
+
 		if resp.StatusCode == http.StatusNoContent {
 			return nil
 		}
@@ -289,7 +420,8 @@ func retryDuration(resp *http.Response) time.Duration {
 }
 
 func (c *Client) get(ctx context.Context, url string, result interface{}) error {
-	for {
+	maxRetries := 2 // Allow one retry after token refresh
+	for retryCount := 0; retryCount < maxRetries; retryCount++ {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if c.acceptLanguage != "" {
 			req.Header.Set("Accept-Language", c.acceptLanguage)
@@ -304,14 +436,28 @@ func (c *Client) get(ctx context.Context, url string, result interface{}) error 
 
 		defer resp.Body.Close()
 
-		if resp.StatusCode == http.StatusTooManyRequests && c.autoRetry {
-			select {
-			case <-ctx.Done():
-				// If the context is cancelled, return the original error
-			case <-time.After(retryDuration(resp)):
+		if c.autoRetry && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusUnauthorized) {
+			// Handle 401 specifically for token refresh
+			if resp.StatusCode == http.StatusUnauthorized {
+				if err := c.refreshTokenIfNeeded(ctx, resp.StatusCode); err != nil {
+					return fmt.Errorf("token refresh failed: %w", err)
+				}
+				// Continue to retry the request with the new token
 				continue
 			}
+
+			// Handle rate limiting
+			if resp.StatusCode == http.StatusTooManyRequests {
+				select {
+				case <-ctx.Done():
+					// If the context is cancelled, return the original error
+					return ctx.Err()
+				case <-time.After(retryDuration(resp)):
+					continue
+				}
+			}
 		}
+
 		if resp.StatusCode == http.StatusNoContent {
 			return nil
 		}
@@ -321,6 +467,7 @@ func (c *Client) get(ctx context.Context, url string, result interface{}) error 
 
 		return json.NewDecoder(resp.Body).Decode(result)
 	}
+	return errors.New("max retries exceeded")
 }
 
 // NewReleases gets a list of new album releases featured in Spotify.
